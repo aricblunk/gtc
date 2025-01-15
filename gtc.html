@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Optimized 3D Particle Simulator with Octree</title>
+    <style>
+        body { margin: 0; }
+        canvas { width: 100%; height: 100%; }
+        #overlay {
+            position: absolute;
+            top: 50%; /* Vertical center */
+            left: 0; /* Align to left edge */
+            transform: translateY(-50%); /* Center vertically */
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 20px;
+            font-size: 16px;
+            z-index: 100;
+            max-width: 400px; /* Adjust width as needed */
+            box-sizing: border-box;
+        }
+        #shiftEffect {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            mix-blend-mode: screen;
+            z-index: 50;
+        }
+    </style>
+</head>
+<body>
+<div id="overlay">
+    WASDQE to translate/move camera<br>
+    Mouse to look around<br><br>
+    Black holes grow with MASS proportional to RADIUS,<br>
+    not VOLUME (constant DENSITY matter),<br>
+    nor even SURFACE AREA (entropy)<br><br>
+    The event horizon volume still grows with RADIUS^3,<br>
+    and DENSITY inverse to SURFACE AREA<br><br>
+    This may be why intermediate mass black holes do not exist
+</div>
+<div id="statsDiv" style="position: absolute; top: 0; left: 0; color: green;"></div>
+<canvas id="shiftEffect"></canvas>
+<script src="three.js"></script>
+<script>
+    // Camera and Scene Constants
+    const FOV = 75; // Field of view for the camera
+    const NEAR_PLANE = 0.001; // Near clipping plane
+    const FAR_PLANE = 1000; // Far clipping plane
+    const CAMERA_INITIAL_Z = 15; // Initial Z position of the camera
+
+    // Ground Plane Constants
+    const GROUND_SIZE = 50; // Size of the ground plane
+    const GROUND_SEGMENTS = 50; // Number of segments in the ground plane
+    const HILL_PEAK_HEIGHT = 0.75; // Peak height of the hills
+
+    // Frequency Ranges
+    const FREQUENCY_RANGE_1 = [1/3, 1/4]; // First frequency range in units per cycle
+    const FREQUENCY_RANGE_2 = [1/4, 1/5]; // Second frequency range in units per cycle
+    const FREQUENCY_RANGE_3 = [1/5, 1/6]; // Third frequency range in units per cycle
+
+    // Lighting Constants
+    const SUNLIGHT_COLOR = 0xfffff0; // Color of the sunlight
+    const SUNLIGHT_INTENSITY = 200; // Intensity of the sunlight
+    const SUNLIGHT_DISTANCE = 0; // Distance of the sunlight (0 for infinite)
+    const SUNLIGHT_DECAY = 1.5; // Decay rate of the sunlight
+    const AMBIENT_LIGHT_COLOR = 0x6080b0; // Color of the ambient light
+    const AMBIENT_LIGHT_INTENSITY = 0.5; // Intensity of the ambient light
+
+    // Background and Fog Constants
+    const BACKGROUND_HUE = 0.55; // Hue of the background color
+    const BACKGROUND_SATURATION = 0.3; // Saturation of the background color
+    const BACKGROUND_LIGHTNESS = 0.5; // Lightness of the background color
+    const FOG_NEAR = 0.1; // Near distance for the fog
+    const FOG_FAR = 120; // Far distance for the fog
+
+    // Particle Simulation Constants
+    const PARTICLE_COUNT = 1000; // Number of particles in the simulation
+	const PARTICLE_START_SPEED_MIN = 0.005; // Minimum initial speed of particles
+    const PARTICLE_START_SPEED_MAX = 0.02; // Maximum initial speed of particles
+    //const PARTICLE_START_MASS = 1; // Initial mass of particles, todo: set a min and max mass range, and also speed?
+	const PARTICLE_START_MASS_MIN = 3; // Initial mass of particles, todo: set a min and max mass range, and also speed?
+	const PARTICLE_START_MASS_MAX = 50; // Initial mass of particles, todo: set a min and max mass range, and also speed?
+    //const PARTICLE_START_RADIUS = 0.02; // Initial radius of particles
+	const PARTICLE_MASS_RADIUS_RATIO = 0.0005; // 3D EH radius is this times mass, which can be a range, could set this according to DPI...
+    const PARTICLE_SEGS = 12; // Geometry segments per particle
+	const MAX_PARTICLES_EN_SING = PARTICLE_COUNT / 3;
+	const SINGULARITY_RADIUS_MUL = 0.01;
+    const WALL_BOUNCE_MULTIPLIER = 0.9999; // Velocity multiplier on wall bounce
+    const VELOCITY_MULTIPLIER = 0.9999; // Velocity damping per frame
+    const ATTRACT_FORCE = 0.0000003; // Gravitational attraction force constant
+    const DISTANCE_OFFSET = 0.0; // Offset to prevent infinite force at zero distance
+    const BOX_SIZE = 50; // Size of the simulation bounding box
+    const START_BOX_SIZE = 20; // Size of the box where particles start
+    const COLLISION_RADIUS_MULTIPLIER = 1; // Multiplier for collision detection radius. This allows you to make the black holes visually large enough to see without the simulation immediately converging.
+
+    // Octree Constants
+    const MAX_OCTREE_DEPTH = 4; // Maximum depth of the octree
+	const THETA = 0.5;  // Tunable parameter for distance-to-size ratio, higher for accuracy, lower for speed, default 0.5
+
+    // Camera Movement Constants
+    const CAMERA_MOVE_SPEED = 0.1; // Speed of the camera movement
+    const MOUSE_SENSITIVITY = 0.002; // Sensitivity of the mouse for camera rotation
+
+    // Other Constants
+    const MAX_FPS = 250; // Maximum frames per second for the simulation
+
+    // Scene Initialization
+    const ASPECT_RATIO = window.innerWidth / window.innerHeight; // Aspect ratio based on window size
+    const RENDERER_WIDTH = window.innerWidth; // Renderer width
+    const RENDERER_HEIGHT = window.innerHeight; // Renderer height
+    const scene = new THREE.Scene(); // Create a new scene
+    const camera = new THREE.PerspectiveCamera(FOV, ASPECT_RATIO, NEAR_PLANE, FAR_PLANE); // Create a perspective camera
+    const renderer = new THREE.WebGLRenderer(); // Create a WebGL renderer
+
+    camera.position.z = CAMERA_INITIAL_Z; // Set the initial position of the camera
+    renderer.setSize(RENDERER_WIDTH, RENDERER_HEIGHT); // Set the size of the renderer
+    document.body.appendChild(renderer.domElement); // Add the renderer to the document
+
+    // Handle window resize events
+    window.addEventListener('resize', () => {
+        renderer.setSize(window.innerWidth, window.innerHeight); // Update renderer size
+        camera.aspect = window.innerWidth / window.innerHeight; // Update camera aspect ratio
+        camera.updateProjectionMatrix(); // Update the camera projection matrix
+    });
+
+    // Ground Plane Setup
+    const groundGeometry = new THREE.PlaneGeometry(GROUND_SIZE, GROUND_SIZE, GROUND_SEGMENTS, GROUND_SEGMENTS); // Ground geometry
+    const groundPositionArray = groundGeometry.attributes.position.array; // Access position attribute array
+    const groundMaterial = new THREE.MeshStandardMaterial({ color: 0x409040 }); // Ground material
+    const groundMesh = new THREE.Mesh(groundGeometry, groundMaterial); // Ground mesh
+
+    // Function to generate random frequency within a range
+    function randomFrequency(range) {
+        return Math.random() * (range[1] - range[0]) + range[0];
+    }
+
+    // Function to generate a random phase offset based on frequency
+    function randomOffset(frequency) {
+        // Wavelength is the inverse of the frequency (1 / frequency)
+        // Offset should range from 0 to the length of one full cycle (2π / wavelength)
+        return Math.random() * (2 * Math.PI / frequency);
+    }
+
+    // Generate random frequencies and corresponding offsets for X and Z dimensions
+    const freqX1 = randomFrequency(FREQUENCY_RANGE_1);
+    const freqX2 = randomFrequency(FREQUENCY_RANGE_2);
+    const freqX3 = randomFrequency(FREQUENCY_RANGE_3);
+    const offsetX1 = randomOffset(freqX1);
+    const offsetX2 = randomOffset(freqX2);
+    const offsetX3 = randomOffset(freqX3);
+
+    const freqZ1 = randomFrequency(FREQUENCY_RANGE_1);
+    const freqZ2 = randomFrequency(FREQUENCY_RANGE_2);
+    const freqZ3 = randomFrequency(FREQUENCY_RANGE_3);
+    const offsetZ1 = randomOffset(freqZ1);
+    const offsetZ2 = randomOffset(freqZ2);
+    const offsetZ3 = randomOffset(freqZ3);
+
+    for (let i = 0; i < groundPositionArray.length; i += 3) {
+        const x = groundPositionArray[i];
+        const z = groundPositionArray[i + 1];
+
+        // Apply multiple sinusoidal functions for different hill sizes
+        const height = (
+            Math.sin(x * freqX1 + offsetX1) + Math.sin(z * freqZ1 + offsetZ1) +
+            Math.sin(x * freqX2 + offsetX2) + Math.sin(z * freqZ2 + offsetZ2) +
+            Math.sin(x * freqX3 + offsetX3) + Math.sin(z * freqZ3 + offsetZ3)
+        ) * HILL_PEAK_HEIGHT;
+
+        groundPositionArray[i + 2] = height; // Set height based on hill generation
+    }
+    groundGeometry.attributes.position.needsUpdate = true; // Flag for updating position
+    groundGeometry.computeVertexNormals(); // Compute normals for shading
+    groundMesh.rotation.x = -Math.PI / 2; // Rotate ground to horizontal plane
+    groundMesh.position.y = -BOX_SIZE / 2 + HILL_PEAK_HEIGHT * Math.PI * 2; // Position ground at bottom of bounding box
+    scene.add(groundMesh); // Add ground to the scene
+
+    // Lighting Setup
+    const sunlight = new THREE.PointLight(SUNLIGHT_COLOR, SUNLIGHT_INTENSITY, SUNLIGHT_DISTANCE, SUNLIGHT_DECAY); // Create sunlight
+    sunlight.position.set(0, 0, 0); // Position sunlight at origin
+    scene.add(sunlight); // Add sunlight to scene
+
+    const ambientLight = new THREE.AmbientLight(AMBIENT_LIGHT_COLOR, AMBIENT_LIGHT_INTENSITY); // Create ambient light
+    scene.add(ambientLight); // Add ambient light to scene
+
+    // Background and Fog Setup
+    scene.background = new THREE.Color().setHSL(BACKGROUND_HUE, BACKGROUND_SATURATION, BACKGROUND_LIGHTNESS); // Set background color
+    scene.fog = new THREE.Fog(scene.background, FOG_NEAR, FOG_FAR); // Add fog to scene
+
+    // Bounding Box Setup
+    const boundingBoxGeometry = new THREE.BoxGeometry(BOX_SIZE, BOX_SIZE, BOX_SIZE); // Bounding box geometry
+    const boundingBoxMaterial = new THREE.MeshPhongMaterial({
+        color: 0xc0c0c0,
+        transparent: true,
+        opacity: 0.12,
+        side: THREE.DoubleSide
+    }); // Bounding box material
+    const boundingBoxMesh = new THREE.Mesh(boundingBoxGeometry, boundingBoxMaterial); // Bounding box mesh
+    scene.add(boundingBoxMesh); // Add bounding box to scene
+
+    // Particle Simulation Variables
+    const particles = []; // Array to store particle meshes
+    const tempVector = new THREE.Vector3(); // Temporary vector for calculations
+	let enableSingularities = false; // Flag to enable singularities and redshift/blueshift effect
+
+    // Particle Creation Function
+    function createParticle() {
+		const particleStartMass = Math.random() * (PARTICLE_START_MASS_MAX - PARTICLE_START_MASS_MIN) + PARTICLE_START_MASS_MIN;
+        const particleGeometry = new THREE.SphereGeometry(particleStartMass * PARTICLE_MASS_RADIUS_RATIO, PARTICLE_SEGS, PARTICLE_SEGS); // Particle geometry
+        const particleMaterial = new THREE.MeshBasicMaterial({ color: 0x202020, side: THREE.DoubleSide }); // Particle material
+        const particleMesh = new THREE.Mesh(particleGeometry, particleMaterial); // Particle mesh
+
+        particleMesh.hasSingularity = false; // Flag to track if singularity is added
+		particleMesh.mass = particleStartMass; // Set initial mass
+
+        // Set random initial position within starting box
+        particleMesh.position.set(
+            Math.random() * START_BOX_SIZE - START_BOX_SIZE / 2,
+            Math.random() * START_BOX_SIZE - START_BOX_SIZE / 2,
+            Math.random() * START_BOX_SIZE - START_BOX_SIZE / 2
+        );
+		
+        particleMesh.velocity = new THREE.Vector3(
+            (Math.random() * 2 - 1) * PARTICLE_START_SPEED_MAX,
+            (Math.random() * 2 - 1) * PARTICLE_START_SPEED_MAX,
+            (Math.random() * 2 - 1) * PARTICLE_START_SPEED_MAX
+        ); // Set initial velocity
+
+        scene.add(particleMesh); // Add particle to scene
+        particles.push(particleMesh); // Add particle to array
+    }
+	
+	// Function to add singularity to a particle
+	function addSingularityToParticle(particleMesh) {
+    if (!particleMesh.hasSingularity) {
+        // Calculate the initial EH radius
+        const eventHorizonRadius = particleMesh.mass * PARTICLE_MASS_RADIUS_RATIO;
+        const singularityRadius = SINGULARITY_RADIUS_MUL * eventHorizonRadius;
+
+        // Create singularity geometry with the calculated radius
+        const singularityGeometry = new THREE.SphereGeometry(singularityRadius, PARTICLE_SEGS, PARTICLE_SEGS);
+        const singularityMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+        const singularityMesh = new THREE.Mesh(singularityGeometry, singularityMaterial);
+        singularityMesh.position.set(0, 0, 0); // Centered in particleMesh
+        particleMesh.add(singularityMesh); // Add singularity to particleMesh
+        particleMesh.singularityMesh = singularityMesh; // Reference to update later
+        particleMesh.hasSingularity = true;
+    }
+}
+
+
+    // Create initial particles
+    for (let i = 0; i < PARTICLE_COUNT; i++) createParticle();
+
+    // Camera Movement Variables
+    const direction = new THREE.Vector3(); // Direction vector for camera movement
+    const pitchQuaternion = new THREE.Quaternion(); // Quaternion for pitch rotation
+    const yawQuaternion = new THREE.Quaternion(); // Quaternion for yaw rotation
+    const moveState = { forward: false, back: false, left: false, right: false, up: false, down: false }; // Movement state
+    let cumulativePitch = 0; // Cumulative pitch angle
+    let cumulativeYaw = 0; // Cumulative yaw angle
+
+    // Event Listeners for Input
+    // Keyboard input for movement
+    document.addEventListener('keydown', (e) => {
+        if (e.key == 'w') moveState.forward = true;
+        if (e.key == 's') moveState.back = true;
+        if (e.key == 'a') moveState.left = true;
+        if (e.key == 'd') moveState.right = true;
+        if (e.key == 'e') moveState.up = true;
+        if (e.key == 'q') moveState.down = true;
+    });
+    document.addEventListener('keyup', (e) => {
+        if (e.key == 'w') moveState.forward = false;
+        if (e.key == 's') moveState.back = false;
+        if (e.key == 'a') moveState.left = false;
+        if (e.key == 'd') moveState.right = false;
+        if (e.key == 'e') moveState.up = false;
+        if (e.key == 'q') moveState.down = false;
+    });
+
+    // Mouse input for camera rotation (pointer lock)
+    renderer.domElement.addEventListener('click', function () {
+        this.requestPointerLock = this.requestPointerLock || this.mozRequestPointerLock || this.webkitRequestPointerLock;
+        this.requestPointerLock();
+    }, false);
+    document.addEventListener('pointerlockchange', lockChangeAlert, false);
+    document.addEventListener('mozpointerlockchange', lockChangeAlert, false);
+
+    function lockChangeAlert() {
+        if (document.pointerLockElement === renderer.domElement || document.mozPointerLockElement === renderer.domElement)
+            document.addEventListener("mousemove", updateCamera, false);
+        else
+            document.removeEventListener("mousemove", updateCamera, false);
+    }
+
+    // Function to update camera based on mouse movement
+    function updateCamera(e) {
+        const movementX = e.movementX || e.mozMovementX || e.webkitMovementX || 0;
+        const movementY = e.movementY || e.mozMovementY || e.webkitMovementY || 0;
+
+        cumulativePitch += -movementY * MOUSE_SENSITIVITY; // Update pitch
+        cumulativePitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, cumulativePitch)); // Clamp pitch
+
+        cumulativeYaw += -movementX * MOUSE_SENSITIVITY; // Update yaw
+
+        pitchQuaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), cumulativePitch); // Create pitch quaternion
+        yawQuaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), cumulativeYaw); // Create yaw quaternion
+
+        camera.quaternion.copy(yawQuaternion).multiply(pitchQuaternion); // Apply rotation to camera
+    }
+
+    // FPS and Statistics Variables
+    let frameCount = 0; // Frame counter
+    let fps = 1; // Frames per second
+    const frameTimestamps = []; // Array to store frame timestamps
+    const statsElement = document.getElementById("statsDiv"); // Element to display stats
+
+    // Function to update stats display
+    function updateStats() {
+        statsElement.innerHTML = `Particles: ${particles.length}<br>FPS: ${fps}`;
+    }
+
+    // Octree Implementation
+    class OctreeNode {
+        constructor(bounds, depth, indices) {
+            this.bounds = bounds; // {min: THREE.Vector3, max: THREE.Vector3}
+            this.depth = depth; // depth of this node
+            this.indices = indices; // {ix, iy, iz}
+            this.children = null; // Array of 8 child nodes
+            this.particles = []; // Particles in this node
+            this.totalMass = 0;
+            this.centerOfMass = new THREE.Vector3();
+        }
+
+        isLeaf() {
+            return this.depth >= MAX_OCTREE_DEPTH;
+        }
+
+        subdivide() {
+            this.children = [];
+            const min = this.bounds.min;
+            const max = this.bounds.max;
+            const mid = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5);
+            const parentIndices = this.indices;
+
+            for (let i = 0; i < 8; i++) {
+                const childMin = new THREE.Vector3(
+                    (i & 1) ? mid.x : min.x,
+                    (i & 2) ? mid.y : min.y,
+                    (i & 4) ? mid.z : min.z
+                );
+                const childMax = new THREE.Vector3(
+                    (i & 1) ? max.x : mid.x,
+                    (i & 2) ? max.y : mid.y,
+                    (i & 4) ? max.z : mid.z
+                );
+                const childBounds = { min: childMin, max: childMax };
+                const childIndices = {
+                    ix: parentIndices.ix * 2 + ((i & 1) ? 1 : 0),
+                    iy: parentIndices.iy * 2 + ((i & 2) ? 1 : 0),
+                    iz: parentIndices.iz * 2 + ((i & 4) ? 1 : 0),
+                };
+                this.children[i] = new OctreeNode(childBounds, this.depth + 1, childIndices);
+            }
+        }
+
+        insert(particle) {
+            if (this.isLeaf()) {
+                this.particles.push(particle);
+                particle.octreeNode = this; // Save the node in the particle
+            } else {
+                if (!this.children) {
+                    this.subdivide();
+                }
+                const index = this.getOctantIndex(particle.position);
+                this.children[index].insert(particle);
+            }
+        }
+
+        getOctantIndex(position) {
+            const min = this.bounds.min;
+            const max = this.bounds.max;
+            const mid = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5);
+            let index = 0;
+            if (position.x >= mid.x) index |= 1;
+            if (position.y >= mid.y) index |= 2;
+            if (position.z >= mid.z) index |= 4;
+            return index;
+        }
+
+        computeMassDistribution() {
+            if (this.isLeaf() || !this.children) {
+				// Leaf node or node with no children
+				this.totalMass = 0;
+				this.centerOfMass.set(0, 0, 0);
+				for (let particle of this.particles) {
+					this.totalMass += particle.mass;
+					this.centerOfMass.add(particle.position.clone().multiplyScalar(particle.mass));
+				}
+				if (this.totalMass > 0) {
+					this.centerOfMass.divideScalar(this.totalMass);
+				}
+			} else {
+				// Internal node with children
+				this.totalMass = 0;
+				this.centerOfMass.set(0, 0, 0);
+				for (let child of this.children) {
+					if (child) {
+						child.computeMassDistribution();  // Recursively compute mass distribution for child nodes
+						this.totalMass += child.totalMass;
+						this.centerOfMass.add(child.centerOfMass.clone().multiplyScalar(child.totalMass));
+					}
+				}
+				if (this.totalMass > 0) {
+					this.centerOfMass.divideScalar(this.totalMass);
+				}
+			}
+        }
+    }
+
+    function computeForceOnParticle(particle, node, force, tempVector) {
+		// Calculate the node's size as the diagonal of its bounding box
+		const nodeSize = node.bounds.max.distanceTo(node.bounds.min);
+		// Calculate the distance between the particle and the node's center of mass
+		tempVector.subVectors(node.centerOfMass, particle.position);
+		const distanceToCenterOfMass = tempVector.length();
+
+		if (distanceToCenterOfMass > THETA * nodeSize) {
+			// If the distance is large enough, summarize the node as a single point mass
+			const forceMagnitude = ATTRACT_FORCE * particle.mass * node.totalMass / (distanceToCenterOfMass * distanceToCenterOfMass + DISTANCE_OFFSET);
+			force.add(tempVector.normalize().multiplyScalar(forceMagnitude));
+		} else {
+			// Recursively handle smaller nodes, or do pairwise particle calculations for leaf nodes
+			if (node.isLeaf()) {
+				// Pairwise force calculation for particles in the same leaf node
+				for (let otherParticle of node.particles) {
+					if (otherParticle !== particle) {
+						tempVector.subVectors(otherParticle.position, particle.position);
+						const distanceSquared = tempVector.lengthSq();
+						const distance = Math.sqrt(distanceSquared);
+						const collisionDistance = COLLISION_RADIUS_MULTIPLIER * PARTICLE_MASS_RADIUS_RATIO * (particle.mass + otherParticle.mass);
+
+						if (distance < collisionDistance) {
+							// Handle collision/merging logic here
+							if (!particle.mergeWith && !otherParticle.mergeWith) {
+								const moreMassive = particle.mass >= otherParticle.mass ? particle : otherParticle;
+								const lessMassive = particle.mass < otherParticle.mass ? particle : otherParticle;
+								lessMassive.mergeWith = moreMassive;
+							}
+						} else {
+							const forceMagnitude = ATTRACT_FORCE * particle.mass * otherParticle.mass / (distanceSquared + DISTANCE_OFFSET);
+							force.add(tempVector.normalize().multiplyScalar(forceMagnitude));
+						}
+					}
+				}
+			} else if (node.children) {
+				// If the node is not a leaf, recurse into the child nodes
+				for (let child of node.children) {
+					if (child && child.totalMass > 0) {
+						computeForceOnParticle(particle, child, force, tempVector);
+					}
+				}
+			}
+		}
+	}
+
+
+    // Create a canvas for the shift effect
+    const shiftEffectCanvas = document.getElementById('shiftEffect');
+    const shiftEffectContext = shiftEffectCanvas.getContext('2d');
+
+    // Adjust the canvas size
+    function resizeShiftEffectCanvas() {
+        shiftEffectCanvas.width = window.innerWidth;
+        shiftEffectCanvas.height = window.innerHeight;
+    }
+    resizeShiftEffectCanvas();
+    window.addEventListener('resize', resizeShiftEffectCanvas);
+
+    // Main Animation Loop
+    function animate() {
+        // Camera movement based on input
+        if (moveState.forward) camera.position.add(direction.set(0, 0, -1).applyQuaternion(camera.quaternion).multiplyScalar(CAMERA_MOVE_SPEED));
+        if (moveState.back) camera.position.add(direction.set(0, 0, 1).applyQuaternion(camera.quaternion).multiplyScalar(CAMERA_MOVE_SPEED));
+        if (moveState.left) camera.position.add(direction.set(-1, 0, 0).applyQuaternion(camera.quaternion).multiplyScalar(CAMERA_MOVE_SPEED));
+        if (moveState.right) camera.position.add(direction.set(1, 0, 0).applyQuaternion(camera.quaternion).multiplyScalar(CAMERA_MOVE_SPEED));
+        if (moveState.up) camera.position.add(camera.up.clone().applyQuaternion(camera.quaternion).multiplyScalar(CAMERA_MOVE_SPEED));
+        if (moveState.down) camera.position.add(camera.up.clone().negate().applyQuaternion(camera.quaternion).multiplyScalar(CAMERA_MOVE_SPEED));
+
+        // Build the octree
+        const halfSize = BOX_SIZE / 2;
+        const min = new THREE.Vector3(-halfSize, -halfSize, -halfSize);
+        const max = new THREE.Vector3(halfSize, halfSize, halfSize);
+        const octreeRoot = new OctreeNode({ min, max }, 0, { ix: 0, iy: 0, iz: 0 });
+
+        // Insert particles into the octree
+        for (let particle of particles) {
+            particle.mergeWith = null; // Reset merge information
+            octreeRoot.insert(particle);
+        }
+
+        // Compute mass distribution
+        octreeRoot.computeMassDistribution();
+
+        // Temporary vectors to avoid excessive allocations
+        const netForce = new THREE.Vector3();
+        const tempVector = new THREE.Vector3();
+
+        // Compute forces and handle collisions
+        for (let particle of particles) {
+            netForce.set(0, 0, 0);
+            computeForceOnParticle(particle, octreeRoot, netForce, tempVector);
+
+            // Apply velocity damping
+            particle.velocity.multiplyScalar(VELOCITY_MULTIPLIER);
+
+            // Update velocity based on net force
+            particle.velocity.add(netForce.divideScalar(particle.mass));
+
+            // Update position
+            particle.position.add(particle.velocity);
+
+            // Handle wall collisions
+            ['x', 'y', 'z'].forEach(axis => {
+                if (Math.abs(particle.position[axis]) > BOX_SIZE / 2) {
+                    particle.velocity[axis] *= -WALL_BOUNCE_MULTIPLIER;
+                    particle.position[axis] = Math.sign(particle.position[axis]) * BOX_SIZE / 2;
+                }
+            });
+        }
+
+        // Handle merging particles
+        const particlesToRemove = new Set();
+        for (let particle of particles) {
+            if (particle.mergeWith && !particlesToRemove.has(particle)) {
+                let moreMassive = particle.mergeWith;
+                let lessMassive = particle;
+
+                if (particlesToRemove.has(moreMassive)) {
+                    // Swap if the more massive particle is already scheduled for removal
+                    const temp = moreMassive;
+                    moreMassive = lessMassive;
+                    lessMassive = temp;
+                }
+
+                // Merge masses
+                moreMassive.mass += lessMassive.mass;
+
+                // Update velocity based on conservation of momentum
+                moreMassive.velocity.multiplyScalar(moreMassive.mass).add(
+                    lessMassive.velocity.multiplyScalar(lessMassive.mass)
+                ).divideScalar(moreMassive.mass);
+
+                // Update geometry to reflect new mass
+                moreMassive.geometry = new THREE.SphereGeometry(moreMassive.mass * PARTICLE_MASS_RADIUS_RATIO, PARTICLE_SEGS, PARTICLE_SEGS);
+                moreMassive.geometry.verticesNeedUpdate = true;
+                moreMassive.geometry.elementsNeedUpdate = true;
+                moreMassive.geometry.computeBoundingSphere();
+
+                // Update the singularity's geometry to remain 10% of the EH radius
+				//if (enableSingularities && moreMassive.hasSingularity) {
+				if (enableSingularities) {
+					if (moreMassive.hasSingularity) {
+						moreMassive.remove(moreMassive.singularityMesh); // Remove old singularity mesh
+					}
+					
+					const eventHorizonRadius = moreMassive.mass * PARTICLE_MASS_RADIUS_RATIO;
+					const singularityRadius = SINGULARITY_RADIUS_MUL * eventHorizonRadius; //dupe code
+					// Create new singularity geometry with updated radius
+					const singularityGeometry = new THREE.SphereGeometry(singularityRadius, PARTICLE_SEGS, PARTICLE_SEGS);
+					const singularityMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+					const singularityMesh = new THREE.Mesh(singularityGeometry, singularityMaterial);
+					singularityMesh.position.set(0, 0, 0); // Centered in particleMesh
+					moreMassive.add(singularityMesh); // Add updated singularity to particleMesh
+					moreMassive.singularityMesh = singularityMesh; // Update reference
+				}
+
+                // Mark less massive particle for removal
+                particlesToRemove.add(lessMassive);
+            }
+        }
+
+        // Remove merged particles
+        for (let particle of particlesToRemove) {
+            scene.remove(particle);
+            particles.splice(particles.indexOf(particle), 1);
+        }
+		
+		// Enable singularities and redshift/blueshift effect when particle count <= 500
+        if (!enableSingularities && particles.length <= MAX_PARTICLES_EN_SING) {
+            enableSingularities = true;
+            for (let particle of particles) {
+                addSingularityToParticle(particle);
+            }
+        }
+
+        // Render the scene
+        renderer.render(scene, camera);
+
+        // Update frame count and FPS
+        frameCount++;
+        const now = performance.now();
+        frameTimestamps.push(now);
+        while (frameTimestamps.length > 0 && frameTimestamps[0] <= now - 1000) frameTimestamps.shift();
+        fps = frameTimestamps.length;
+
+        // Update stats display
+        updateStats();
+
+        // Blueshift/Redshift Effect
+        if (enableSingularities) {
+            applyShiftEffect();
+        } else {
+            // Clear the shift effect canvas
+            shiftEffectContext.clearRect(0, 0, shiftEffectCanvas.width, shiftEffectCanvas.height);
+        }
+    }
+
+    // Function to apply the blueshift/redshift effect
+    function applyShiftEffect() {
+        // Clear the shift effect canvas
+        shiftEffectContext.clearRect(0, 0, shiftEffectCanvas.width, shiftEffectCanvas.height);
+
+        let maxEffect = 0;
+        let effectColor = { r: 0, g: 0, b: 0 };
+
+        const cameraPosition = camera.position.clone();
+        const cameraDirection = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+
+        for (let particle of particles) {
+            const toParticle = tempVector.subVectors(particle.position, cameraPosition);
+            const distance = toParticle.length();
+
+            const eventHorizonRadius = particle.mass * PARTICLE_MASS_RADIUS_RATIO;
+            if (distance < eventHorizonRadius) {
+                // Inside event horizon
+                const distanceFactor = 1 - (distance / eventHorizonRadius); // 0 at horizon, 1 at singularity
+                const angle = cameraDirection.angleTo(toParticle);
+                const angleFactor = (angle / Math.PI); // 0 when looking directly at the particle, 1 when looking away
+
+                const redAmount = (1 - angleFactor) * distanceFactor; // Max red when looking at singularity
+                const blueAmount = angleFactor * distanceFactor; // Max blue when looking away from singularity
+
+                const effectStrength = distanceFactor; // Use distanceFactor as overall effect strength
+
+                // Choose the stronger effect
+                if (effectStrength > maxEffect) {
+                    maxEffect = effectStrength;
+                    effectColor = {
+                        r: redAmount * 255,
+                        g: 0,
+                        b: blueAmount * 255
+                    };
+                }
+            }
+        }
+
+        if (maxEffect > 0) {
+            // Apply the effect
+            shiftEffectContext.fillStyle = `rgba(${effectColor.r}, ${effectColor.g}, ${effectColor.b}, ${maxEffect})`;
+            shiftEffectContext.fillRect(0, 0, shiftEffectCanvas.width, shiftEffectCanvas.height);
+        }
+    }
+
+    // Start the animation loop
+    setInterval(animate, 1000 / MAX_FPS);
+</script>
+</body>
+</html>
